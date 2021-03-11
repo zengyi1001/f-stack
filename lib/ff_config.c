@@ -414,6 +414,9 @@ port_cfg_handler(struct ff_config *cfg, const char *section,
         cur->port_id = portid;
     }
 
+    cur->http_port = 80;
+    cur->https_port = 443;
+    
     if (strcmp(name, "addr") == 0) {
         cur->addr = strdup(value);
     } else if (strcmp(name, "netmask") == 0) {
@@ -428,8 +431,13 @@ port_cfg_handler(struct ff_config *cfg, const char *section,
         return parse_port_lcore_list(cur, value);
     } else if (strcmp(name, "slave_port_list") == 0) {
         return parse_port_slave_list(cur, value);
-    }
+    } else if (strcmp(name, "http_port") == 0) {
+        cur->http_port = atoi(value);
+    } else if (strcmp(name, "https_port") == 0) {
+        cur->https_port = atoi(value);
+    } 
 
+    printf("cur->http_port %u, cur->https_port %u", cur->http_port, cur->https_port);
     return 1;
 }
 

@@ -183,7 +183,7 @@ int ff_route_ctl(enum FF_ROUTE_CTL req, enum FF_ROUTE_FLAG flag,
  *
  */
 typedef int (*dispatch_func_t)(void *data, uint16_t *len,
-    uint16_t queue_id, uint16_t nb_queues);
+    uint16_t queue_id, uint16_t nb_queues, uint16_t port_id);
 
 /* regist a packet dispath function */
 void ff_regist_packet_dispatcher(dispatch_func_t func);

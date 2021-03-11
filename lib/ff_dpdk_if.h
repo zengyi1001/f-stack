@@ -61,5 +61,27 @@ int ff_dpdk_if_send(struct ff_dpdk_if_context* ctx, void *buf, int total);
 
 void ff_dpdk_pktmbuf_free(void *m);
 
+#define IP_VERSION 0x40
+#define IP6_VERSION 0x60
+#define IP_IS_V4(_hdr) (((_hdr)->version_ihl & 0xf0) == IP_VERSION)
 
+#define IP4_HDR_LEN (sizeof(struct ipv4_hdr))
+#define IP6_HDR_LEN (sizeof(struct ipv6_hdr))
+
+#define L2_HEADER_LEN (sizeof(struct ether_hdr))
+#define L3_HEADER_LEN (sizeof(struct ipv4_hdr) + L2_HEADER_LEN)
+#define TCP_HEADER_LEN (sizeof(struct tcp_hdr) + L3_HEADER_LEN)
+#define UDP_HEADER_LEN (sizeof(struct udp_hdr) + L3_HEADER_LEN)
+#define IPIP_HEADER_LEN (sizeof(struct ipv4_hdr) + L3_HEADER_LEN)
+
+#ifdef INET6
+    #define L3_HEADER_LEN6 (sizeof(struct ipv6_hdr) + L2_HEADER_LEN)
+    #define IPIP_HEADER_LEN6 (sizeof(struct ipv6_hdr) + L3_HEADER_LEN)
+    #define UDP_HEADER_LEN6 (sizeof(struct udp_hdr) + L3_HEADER_LEN6)
+    #define TCP_HEADER_LEN6 (sizeof(struct tcp_hdr) + L3_HEADER_LEN6)
+#endif
+
+
+extern int
+dispatch_pkt(void *data, uint16_t *len, uint16_t queue_id, uint16_t nb_queues, uint16_t port_id);
 #endif /* ifndef _FSTACK_DPDK_IF_H */

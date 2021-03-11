@@ -61,6 +61,9 @@ struct ff_port_cfg {
     char *gateway;
     char *pcap;
 
+    uint16_t http_port;
+    uint16_t https_port;
+
     int nb_lcores;
     int nb_slaves;
     uint16_t lcore_list[DPDK_MAX_LCORE];

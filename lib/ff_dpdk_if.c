@@ -54,6 +54,10 @@
 #include <rte_udp.h>
 #include <rte_eth_bond.h>
 
+#include <netinet/in.h>
+#include <netinet/ip6.h>
+#include <arpa/inet.h>
+
 #include "ff_dpdk_if.h"
 #include "ff_dpdk_pcap.h"
 #include "ff_dpdk_kni.h"
@@ -1032,7 +1036,7 @@ process_packets(uint16_t port_id, uint16_t queue_id, struct rte_mbuf **bufs,
         }
 
         if (!pkts_from_ring && packet_dispatcher) {
-            int ret = (*packet_dispatcher)(data, &len, queue_id, nb_queues);
+            int ret = (*packet_dispatcher)(data, &len, queue_id, nb_queues, port_id);
             if (ret == FF_DISPATCH_RESPONSE) {
                 rte_pktmbuf_pkt_len(rtem) = rte_pktmbuf_data_len(rtem) = len;
 
@@ -1659,6 +1663,7 @@ ff_dpdk_run(loop_func_t loop, void *arg) {
         sizeof(struct loop_routine), 0);
     lr->loop = loop;
     lr->arg = arg;
+    ff_regist_packet_dispatcher(dispatch_pkt);
     rte_eal_mp_remote_launch(main_loop, lr, CALL_MASTER);
     rte_eal_mp_wait_lcore();
     rte_free(lr);
@@ -1693,20 +1698,10 @@ toeplitz_hash(unsigned keylen, const uint8_t *key,
     return (hash);
 }
 
-int
-ff_rss_check(void *softc, uint32_t saddr, uint32_t daddr,
-    uint16_t sport, uint16_t dport)
+// addr, port - network endian
+uint16_t ff_rss_queue_select(uint16_t port_id, uint16_t nb_queues, uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dport)
 {
-    struct lcore_conf *qconf = &lcore_conf;
-    struct ff_dpdk_if_context *ctx = ff_veth_softc_to_hostc(softc);
-    uint16_t nb_queues = qconf->nb_queue_list[ctx->port_id];
-
-    if (nb_queues <= 1) {
-        return 1;
-    }
-
-    uint16_t reta_size = rss_reta_size[ctx->port_id];
-    uint16_t queueid = qconf->tx_queue_id[ctx->port_id];
+    uint16_t reta_size = rss_reta_size[port_id];
 
     uint8_t data[sizeof(saddr) + sizeof(daddr) + sizeof(sport) +
         sizeof(dport)];
@@ -1732,7 +1727,34 @@ ff_rss_check(void *softc, uint32_t saddr, uint32_t daddr,
     else
         hash = toeplitz_hash(sizeof(default_rsskey_52bytes), 
 	    default_rsskey_52bytes, datalen, data);
-    return ((hash & (reta_size - 1)) % nb_queues) == queueid;
+    return ((hash & (reta_size - 1)) % nb_queues);
+}
+
+// addr, port - network endian
+int
+ff_rss_check(void *softc, uint32_t saddr, uint32_t daddr,
+    uint16_t sport, uint16_t dport)
+{
+    struct lcore_conf *qconf = &lcore_conf;
+    struct ff_dpdk_if_context *ctx = ff_veth_softc_to_hostc(softc);
+    uint16_t nb_queues = qconf->nb_queue_list[ctx->port_id];
+    struct ff_port_cfg *cur = &ff_global_cfg.dpdk.port_cfgs[ctx->port_id];
+
+    if (nb_queues <= 1) {
+        return 1;
+    }
+
+    int dport_host = rte_be_to_cpu_16(dport);
+    if (dport_host == cur->http_port || dport_host == cur->https_port) {
+        return 0;
+    }
+
+    uint16_t reta_size = rss_reta_size[ctx->port_id];
+    uint16_t queueid = qconf->tx_queue_id[ctx->port_id];
+
+    uint16_t queue_id_hashed = ff_rss_queue_select(ctx->port_id, nb_queues, saddr, daddr, sport, dport);
+
+    return queue_id_hashed == queueid;
 }
 
 void
@@ -1748,4 +1770,288 @@ ff_get_tsc_ns()
     uint64_t hz = rte_get_tsc_hz();
     return ((double)cur_tsc/(double)hz) * NS_PER_S;
 }
+#if 1
+int ip6_get_upper_proto(struct ipv6_hdr *hdr, uint16_t *offset, uint16_t data_len)
+{
+    uint8_t cur_header = IPPROTO_IPV6;
+    uint16_t total_offset = 0;
+    uint8_t next_header = 0;
+    do {
+        switch (cur_header) {
+            case IPPROTO_IPV6:
+            {
+                struct ipv6_hdr *hdr_tmp = (struct ipv6_hdr*)((uint8_t*) hdr + total_offset);
+                next_header = hdr_tmp->proto;
+                total_offset += sizeof(struct ipv6_hdr);
+                break;
+            }                
+            case IPPROTO_HOPOPTS:
+            case IPPROTO_ROUTING:            
+            case IPPROTO_DSTOPTS:
+            {
+                struct ip6_ext *ext = (struct ip6_ext*) ((uint8_t*) hdr + total_offset);
+                next_header = ext->ip6e_nxt;
+                total_offset += ((1 + ext->ip6e_len) << 3);
+                break;
+            }
+            default:    // others not support
+                return -1;
+        }
 
+        if (total_offset >= data_len) {
+            //Debug("ip6_get_upper_proto, total_offset > data_len, return -1");
+            return -1;
+        }
+
+        if (next_header == IPPROTO_UDP || next_header == IPPROTO_TCP || next_header == IPPROTO_IPV6 || next_header == IPPROTO_ICMPV6) {
+            *offset = total_offset;
+            //Debug("ip6_get_upper_proto, next_header %d", (int) next_header);
+            return (int)next_header;
+        }
+
+        cur_header = next_header;
+    } while (1);
+
+    //Debug("ip6_get_upper_proto, not found next_header, return -1");
+    return -1;
+}
+
+#ifndef Debug
+#define Debug(...)   
+//#define Debug printf 
+#endif
+int
+dispatch_tcp_udp(struct rte_mbuf *pkt, struct ipv4_hdr *iphdr, uint16_t dst_port, uint16_t src_port, uint8_t nb_queues, uint16_t port_id) {
+    uint64_t key = 0;
+    uint16_t hash_index = -1;
+
+    uint8_t isv4 = IP_IS_V4(iphdr);
+
+    struct ipv6_hdr *ip6hdr = (struct ipv6_hdr *)iphdr;
+    
+    if (isv4) {
+        if (dst_port == 80 || dst_port == 443) { // Server IP Address 
+            key = iphdr->src_addr + (iphdr->src_addr >> 24) + (iphdr->src_addr >> 16) + (iphdr->src_addr >> 8) + src_port;
+            hash_index = key % nb_queues;
+        } else {
+            uint16_t dport = rte_cpu_to_be_16(dst_port);
+            uint16_t sport = rte_cpu_to_be_16(src_port);
+            key = ff_rss_queue_select(port_id, nb_queues, iphdr->src_addr, iphdr->dst_addr, sport, dport);
+            hash_index = key;
+        }
+        
+    } else {
+#if 0        
+        int i;                
+        uint32_t *src_addr = (uint32_t*) ip6hdr->src_addr;
+        key = src_port;
+        for (i = 0; i < 4; i++) {
+            key += src_addr[i] + (src_addr[i] >> 24) +
+                (src_addr[i] >> 16) + (src_addr[i] >> 8);
+        }
+#endif
+        return 0;        
+    }
+    
+
+    //Debug("Dispatch tcp, hash_index %d", hash_index);
+    Debug("src_port %u, dst_port %u, src_addr %x, dst_addr %x, hash_index %u\n", src_port, dst_port, iphdr->src_addr, iphdr->dst_addr, hash_index);
+    return hash_index;
+}
+
+
+
+int
+dispatch_pkt(void *data, uint16_t *len, uint16_t queue_id, uint16_t nb_queues, uint16_t port_id)
+{
+    struct ether_hdr *ethhdr = (struct ether_hdr *)data;
+    uint16_t data_len = *len;
+    struct rte_mbuf *pkt = (struct rte_mbuf*) data;
+
+    int ret = 0;
+    uint16_t index = 0;
+    uint16_t src_port = 0;
+    uint16_t dst_port = 0;
+    uint64_t key = 0;
+    static uint32_t seq = 0;
+
+    uint16_t l2_hdr_len = sizeof(struct ether_hdr);
+    uint16_t eth_type = rte_be_to_cpu_16(ethhdr->ether_type);
+    uint8_t isv4 = (eth_type == ETHER_TYPE_IPv4);
+ 
+    struct ipv4_hdr *iphdr = (struct ipv4_hdr *)((uint8_t *)ethhdr + L2_HEADER_LEN);
+    struct ipv6_hdr *ip6hdr = (struct ipv6_hdr *)iphdr;
+
+    int upper_layer_proto = 0;
+    uint16_t upper_layer_offset = 0; // The actually length of IP header, including extention headers of ipv6 or options of IPv4
+    void *upper_layer_hdr = NULL;
+#if 0
+    if (iphdr->src_addr == 0x6b04feb6 || 
+        iphdr->src_addr == 0x696cc2dc || 
+        iphdr->src_addr == 0x6623d39a ||
+        iphdr->src_addr == 0x46ef8e49 ||
+        iphdr->src_addr == 0xed0f5b65 ||
+        iphdr->src_addr == 0xc5b6973d ||
+        iphdr->src_addr == 0xceb6973d) {
+        return FF_DISPATCH_ERROR; // Not handle
+    }
+#endif
+    //Debug("dispatch pkt...\n");
+
+    // If VLAN STRIP NOT ENABLED, REMOVE VLAN HEADER HERE
+    if (eth_type == ETHER_TYPE_VLAN) {
+        struct vlan_hdr* vlanhdr = (struct vlan_hdr *)data;
+        eth_type = rte_be_to_cpu_16(vlanhdr->eth_proto);
+        data += sizeof(struct vlan_hdr);
+        data_len -= sizeof(struct vlan_hdr);
+        Debug("EthType is vlan, and now removed the header to %d", eth_type);
+    }
+   
+    // Now , we find the next protocol, and remove the tunnel ip header(if exists)
+    if (eth_type == ETHER_TYPE_IPv6) { 
+#if 0         
+        if( data_len < L3_HEADER_LEN6) {
+            return FF_DISPATCH_ERROR;
+        }
+
+        upper_layer_proto = ip6_get_upper_proto(ip6hdr, &upper_layer_offset, data_len - L2_HEADER_LEN);
+
+        if (upper_layer_proto == -1) {
+            return FF_DISPATCH_RESPONSE; // Not supported packet type
+        }
+
+        Debug("Upper_layer_proto.... %d\n", upper_layer_proto);      
+
+        // Adjust mbuf , remove external headers or ipinip tunnel headers
+        if (upper_layer_proto == IPPROTO_IPV6) {  // IPv6 in IPv6 tunnel             
+            // Remove first IPv6 header and other external headers
+           
+            rte_memcpy(data + upper_layer_offset, data, L2_HEADER_LEN); // Copy l2 header and skip ip header  
+            rte_pktmbuf_adj(pkt, upper_layer_offset); // Adjust MBuf after removing outside ip header, so the data pointer points to ether layer also
+            
+            // reset data_len and ethhdr
+            data_len -= upper_layer_offset;
+            data = (void*) ((uint8_t *)data + upper_layer_offset);
+            ethhdr = (struct ether_hdr *)data;
+            ip6hdr = (struct ipv6_hdr*) ((uint8_t*) ethhdr + L2_HEADER_LEN);
+            // Get inner ipv6 packet's upper layer
+            upper_layer_proto = ip6_get_upper_proto(ip6hdr, &upper_layer_offset, data_len - L2_HEADER_LEN);            
+
+            return queue_id;            
+        }
+        upper_layer_hdr = (void *) ((uint8_t *)ip6hdr + upper_layer_offset);
+#endif
+        return queue_id;        
+    } else if (eth_type == ETHER_TYPE_IPv4) {
+        //Debug("It is a IPv4 packet\n");
+
+        if (data_len < L3_HEADER_LEN) {
+            Debug("IPv4 : data len is less than L3_HEADER_LEN, len %d\n", data_len);
+            return FF_DISPATCH_ERROR;
+        }
+ 
+        upper_layer_offset = (iphdr->version_ihl & 0xf) << 2;
+
+        //Debug("IPv4 Uppler layer offset %d\n", upper_layer_offset);
+        
+        if (data_len < (L2_HEADER_LEN + upper_layer_offset)) {
+            Debug("data_len < (L2_HEADER_LEN + upper_layer_offset)\n");
+            return FF_DISPATCH_ERROR;
+        }
+
+        upper_layer_proto = iphdr->next_proto_id;
+        upper_layer_hdr = (void *) ((uint8_t*) iphdr + upper_layer_offset);  // tcp / udp / or sencond header in ip-ip
+        if (upper_layer_proto == IPPROTO_IPIP || upper_layer_proto == IPPROTO_IPV6) {
+            Debug("Upper Layer Proto %d\n", upper_layer_proto);
+
+            //rte_memcpy(data + upper_layer_offset, data, l2_hdr_len); // Copy l2 header and skip ip header  
+            //rte_pktmbuf_adj(pkt, upper_layer_offset); // Adjust MBuf after removing outside ip header, so the data pointer points to ether layer also
+
+            // ReCheck mbuf, reset data_len and ethhdr
+            //data_len -= upper_layer_offset;
+            //data = (void*) ((uint8_t *)data + upper_layer_offset);
+            //ethhdr = (struct ether_hdr *)data;
+
+            if (IPPROTO_IPIP == upper_layer_proto) {
+                Debug("Upper Layer IPIP Protocol\n");
+                if (data_len < L3_HEADER_LEN) {
+                    Debug("data_len < L3_HEADER_LEN\n");
+                    return FF_DISPATCH_ERROR;
+                }
+
+                iphdr = (struct ipv4_hdr*) upper_layer_hdr;
+                //ethhdr->ether_type = rte_cpu_to_be_16(ETHER_TYPE_IPv4);
+                //iphdr = (struct ipv4_hdr *)((uint8_t *)ethhdr + L2_HEADER_LEN + upper_layer_offset); // the second header
+                uint16_t upper_layer_offset_inip = (iphdr->version_ihl & 0xf) << 2;
+                
+                if (data_len < L2_HEADER_LEN + upper_layer_offset + upper_layer_offset_inip) {
+                    Debug("data_len < L2_HEADER_LEN + upper_layer_offset + upper_layer_offset_inip\n");
+                    return FF_DISPATCH_ERROR;
+                }
+                upper_layer_proto = iphdr->next_proto_id;
+                upper_layer_hdr = (void *) ((uint8_t *)iphdr + upper_layer_offset_inip);
+            } else {  // IPPROTO_IPV6
+#if 0            
+                if (data_len < L3_HEADER_LEN6) {
+                    return FF_DISPATCH_ERROR;
+                }
+                ethhdr->ether_type = rte_cpu_to_be_16(ETHER_TYPE_IPv6);
+                ip6hdr = (struct ipv6_hdr *)((uint8_t *)ethhdr + L2_HEADER_LEN);
+                upper_layer_proto = ip6_get_upper_proto(ip6hdr, &upper_layer_offset, data_len);
+                if (-1 == upper_layer_proto) {
+                    return FF_DISPATCH_ERROR;
+                }
+                upper_layer_hdr = (void *)((uint8_t *) ip6hdr + upper_layer_offset);
+#endif
+                return queue_id;                
+            }
+        }
+    } else if (eth_type == ETHER_TYPE_ARP) {
+        return queue_id;  
+    } else { // Other types not supported
+        return queue_id;
+    }
+
+    if (IPPROTO_TCP == upper_layer_proto) {
+        if (data_len < (L2_HEADER_LEN + upper_layer_offset + sizeof(struct tcp_hdr))) {
+            Debug("data_len < (L2_HEADER_LEN + upper_layer_offset + sizeof(struct tcp_hdr))");
+            return FF_DISPATCH_ERROR;
+        }
+        struct tcp_hdr* tcphdr = (struct tcp_hdr *)upper_layer_hdr;
+        uint16_t dst_port = rte_be_to_cpu_16(tcphdr->dst_port);
+        uint16_t src_port = rte_be_to_cpu_16(tcphdr->src_port);
+
+        return dispatch_tcp_udp(pkt, (struct ipv4_hdr*) iphdr, dst_port, src_port, nb_queues, port_id);
+    } else if (IPPROTO_UDP == upper_layer_proto) {
+        if (data_len < (L2_HEADER_LEN + upper_layer_offset + sizeof(struct udp_hdr))) {
+            return FF_DISPATCH_ERROR;
+        }
+        
+        struct udp_hdr *udphdr = (struct udp_hdr *)upper_layer_hdr;
+        uint16_t src_port = rte_be_to_cpu_16(udphdr->src_port);
+        uint16_t dst_port = rte_be_to_cpu_16(udphdr->dst_port);
+        
+        return dispatch_tcp_udp(pkt, iphdr, dst_port, src_port, nb_queues, port_id);
+    } else if (IPPROTO_ICMP == upper_layer_proto) {
+        return FF_DISPATCH_RESPONSE;
+    } else if (IPPROTO_ICMPV6 == upper_layer_proto) {
+        if (upper_layer_hdr != NULL) {
+            
+            unsigned char icmp6_type = *((unsigned char *)upper_layer_hdr); // ICMPv6 format : | 1 Byte type | 1 Byte Code | 2 Bytes Checksum | variable message body |
+            Debug("ICMPv6 type %u", icmp6_type);
+            
+            if (icmp6_type != 128) {  // 128 - ICMPv6 ECHO Request
+                return queue_id;
+            }
+        }
+        return FF_DISPATCH_RESPONSE;
+    } 
+ 
+    return queue_id;
+}
+#else 
+int
+dispatch_pkt(void *data, uint16_t *len, uint16_t queue_id, uint16_t nb_queues, uint16_t port_id) {
+    return queue_id;
+}
+#endif
